@@ -43,3 +43,4 @@ htmlcov/
 # OS temporary files
 *.tmp
 *.swp
+.env
