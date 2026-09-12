@@ -17,3 +17,5 @@ from app.models.academic import (  # noqa: F401
     SessionParticipantGroup,
     SubBatch,
 )
+
+from app.models.auth import User, UserRole  # noqa: F401
