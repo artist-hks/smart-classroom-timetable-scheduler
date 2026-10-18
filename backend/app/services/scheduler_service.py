@@ -17,6 +17,12 @@ from app.algorithms.ga_optimizer import (
     GAOptimizationResult,
     TimetableGAOptimizer,
 )
+from app.algorithms.rescheduler import (
+    DynamicRescheduler,
+    RescheduleTrigger,
+    RescheduleTriggerType,
+    ReschedulingResult,
+)
 from app.algorithms.resource_allocator import (
     AllocatedSession,
     ResourceAllocationResult,
@@ -147,5 +153,31 @@ class TimetableSchedulerService:
             config=config,
         )
         return optimizer.optimize(allocations=allocations, max_time_seconds=max_time_seconds)
+
+    @staticmethod
+    def reschedule_timetable(
+        grid: ScheduleGrid,
+        current_schedule: Sequence[AllocatedSession],
+        trigger: RescheduleTrigger,
+        resources: Sequence[ResourceSpec],
+        faculty_members: dict[int, FacultySpec],
+        substitute_faculty_pool: dict[int, list[int]] | None = None,
+    ) -> ReschedulingResult:
+        """
+        Runs Dynamic Rescheduling Engine (Engine 4).
+        Scopes impact to affected sub-batches/faculty/rooms, isolates the subproblem,
+        preserves unaffected sessions (EV-8 >= 85%), and generates ranked alternative resolutions.
+        """
+        rescheduler = DynamicRescheduler(
+            grid=grid,
+            resources=resources,
+            faculty_members=faculty_members,
+            substitute_faculty_pool=substitute_faculty_pool,
+        )
+        return rescheduler.resolve_rescheduling(
+            current_schedule=current_schedule,
+            trigger=trigger,
+        )
+
 
 
