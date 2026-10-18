@@ -17,6 +17,11 @@ from app.algorithms.ga_optimizer import (
     GAOptimizationResult,
     TimetableGAOptimizer,
 )
+from app.algorithms.ml_demand_predictor import (
+    MLDemandDatasetGenerator,
+    MLModelMetadata,
+    RoomDemandPredictor,
+)
 from app.algorithms.rescheduler import (
     DynamicRescheduler,
     RescheduleTrigger,
@@ -178,6 +183,30 @@ class TimetableSchedulerService:
             current_schedule=current_schedule,
             trigger=trigger,
         )
+
+    @staticmethod
+    def predict_room_demand_matrix(
+        grid: ScheduleGrid,
+        resources: Sequence[ResourceSpec],
+        department_id: int = 1,
+        semester: int = 5,
+        model_version: str = "v1.0.0-piet-simulated",
+    ) -> tuple[dict[tuple[int, int, int], float], MLModelMetadata]:
+        """
+        Runs ML Room Demand Prediction Engine.
+        Trains/evaluates the regression model (FR-3.7.1 - FR-3.7.3) and generates
+        the (resource_id, day, slot_id) -> demand_score matrix for Smart Resource Allocation.
+        """
+        predictor = RoomDemandPredictor(model_version=model_version)
+        metadata = predictor.train_and_evaluate()
+        matrix = predictor.generate_demand_matrix(
+            grid=grid,
+            resources=resources,
+            department_id=department_id,
+            semester=semester,
+        )
+        return matrix, metadata
+
 
 
 
