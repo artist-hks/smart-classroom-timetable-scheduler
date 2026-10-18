@@ -45,6 +45,11 @@ class ScheduleGrid:
         for day in self.slots_by_day:
             self.slots_by_day[day].sort(key=lambda s: s.period)
 
+    @property
+    def days(self) -> int:
+        """Returns the number of operational days on the grid."""
+        return len(self.slots_by_day)
+
     @classmethod
     def create_standard_piet_grid(
         cls,
