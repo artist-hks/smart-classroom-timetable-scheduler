@@ -12,6 +12,11 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 from app.algorithms.cpsat_solver import CPSATScheduler, CPSATSolverResult, FacultySpec, ScheduledAssignment
+from app.algorithms.ga_optimizer import (
+    GAOptimizationConfig,
+    GAOptimizationResult,
+    TimetableGAOptimizer,
+)
 from app.algorithms.resource_allocator import (
     AllocatedSession,
     ResourceAllocationResult,
@@ -120,4 +125,27 @@ class TimetableSchedulerService:
             session_equipment=session_equipment,
             preferred_building=preferred_building,
         )
+
+    @staticmethod
+    def optimize_timetable(
+        grid: ScheduleGrid,
+        allocations: Sequence[AllocatedSession],
+        resources: Sequence[ResourceSpec],
+        faculty_members: dict[int, FacultySpec] | None = None,
+        config: GAOptimizationConfig | None = None,
+        max_time_seconds: float = 15.0,
+    ) -> GAOptimizationResult:
+        """
+        Runs Genetic Algorithm (GA) Optimization (Engine 3).
+        Evolves soft-constraint objectives (SC-01 to SC-11) while strictly preserving
+        zero hard-constraint violations (HC-01 to HC-16).
+        """
+        optimizer = TimetableGAOptimizer(
+            grid=grid,
+            resources=resources,
+            faculty_members=faculty_members,
+            config=config,
+        )
+        return optimizer.optimize(allocations=allocations, max_time_seconds=max_time_seconds)
+
 
