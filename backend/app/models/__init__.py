@@ -19,3 +19,6 @@ from app.models.academic import (  # noqa: F401
 )
 
 from app.models.auth import User, UserRole  # noqa: F401
+from app.models.faculty import Faculty, FacultyAvailability, FacultySubject  # noqa: F401
+from app.models.resource import Resource, ResourceEquipment  # noqa: F401
+from app.models.timeslot import Break, TimeSlot  # noqa: F401
