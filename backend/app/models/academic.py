@@ -275,10 +275,10 @@ class Session(Base):
     scheduled_day: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     start_time: Mapped[Time | None] = mapped_column(Time, nullable=True)
     end_time: Mapped[Time | None] = mapped_column(Time, nullable=True)
-    # NOTE: no ForeignKey() here on purpose — `resources` table does not exist
-    # yet (owned by SB2/US5/T2). Add the FK constraint in that migration via:
-    #   op.create_foreign_key(..., 'sessions', 'resources', ['resource_id'], ['resource_id'])
-    resource_id: Mapped[int | None] = mapped_column(nullable=True)
+    # FK to resources added in SB2/US5/T1 (migration b7e2c4a91d05).
+    resource_id: Mapped[int | None] = mapped_column(
+        ForeignKey("resources.resource_id"), nullable=True
+    )
     status: Mapped[SessionStatus] = mapped_column(
         SAEnum(SessionStatus, name="session_status_enum"),
         nullable=False,
@@ -311,9 +311,10 @@ class SessionFaculty(Base):
     session_id: Mapped[int] = mapped_column(
         ForeignKey("sessions.session_id", ondelete="CASCADE"), nullable=False
     )
-    # NOTE: no ForeignKey() here on purpose — `faculty` table does not exist
-    # yet (owned by SB2/US4/T2). Add the FK constraint in that migration.
-    faculty_id: Mapped[int] = mapped_column(nullable=False)
+    # FK to faculty added in SB2/US4/T1 (migration b7e2c4a91d05).
+    faculty_id: Mapped[int] = mapped_column(
+        ForeignKey("faculty.faculty_id"), nullable=False
+    )
 
     __table_args__ = (
         UniqueConstraint("session_id", "faculty_id", name="uq_session_faculty_pair"),
