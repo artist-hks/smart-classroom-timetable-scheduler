@@ -11,7 +11,13 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from app.algorithms.cpsat_solver import CPSATScheduler, CPSATSolverResult, FacultySpec
+from app.algorithms.cpsat_solver import CPSATScheduler, CPSATSolverResult, FacultySpec, ScheduledAssignment
+from app.algorithms.resource_allocator import (
+    AllocatedSession,
+    ResourceAllocationResult,
+    ResourceSpec,
+    SmartResourceAllocator,
+)
 from app.algorithms.session_generator import (
     CourseToSessionGenerator,
     GeneratedSession,
@@ -91,3 +97,27 @@ class TimetableSchedulerService:
             reserved_slot_ids=reserved_slot_ids,
         )
         return scheduler.solve(time_limit_seconds=time_limit_seconds)
+
+    @staticmethod
+    def allocate_resources(
+        assignments: Sequence[ScheduledAssignment],
+        resources: Sequence[ResourceSpec],
+        predicted_demand: dict[tuple[int, int, int], float] | None = None,
+        session_equipment: dict[int, dict[str, int]] | None = None,
+        preferred_building: str | None = None,
+    ) -> ResourceAllocationResult:
+        """
+        Runs Smart Resource Allocation & Mandatory Validation (Engine 2).
+        Scores candidates and assigns conflict-free rooms matching capacity,
+        type, equipment, and availability.
+        """
+        allocator = SmartResourceAllocator(
+            resources=resources,
+            predicted_demand=predicted_demand,
+        )
+        return allocator.allocate_and_validate(
+            assignments=assignments,
+            session_equipment=session_equipment,
+            preferred_building=preferred_building,
+        )
+

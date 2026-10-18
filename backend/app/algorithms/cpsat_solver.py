@@ -17,6 +17,7 @@ from ortools.sat.python import cp_model
 
 from app.algorithms.session_generator import GeneratedSession, ParticipantGroupSpec
 from app.algorithms.timeslot_grid import GridSlot, ScheduleGrid
+from app.models.academic import ResourceType
 
 
 @dataclass
@@ -44,6 +45,9 @@ class ScheduledAssignment:
     faculty_ids: list[int]
     participant_group_id: int
     subbatch_ids: list[int]
+    department_id: int = 1
+    required_resource_type: ResourceType | None = None
+    required_capacity: int = 0
 
 
 @dataclass
@@ -287,6 +291,9 @@ class CPSATScheduler:
                             faculty_ids=s.faculty_ids,
                             participant_group_id=s.participant_group_id,
                             subbatch_ids=pg.subbatch_ids if pg else [],
+                            department_id=s.department_id,
+                            required_resource_type=s.required_resource_type,
+                            required_capacity=s.required_capacity if s.required_capacity > 0 else (pg.combined_strength if pg else 0),
                         )
                         assignments.append(assignment)
                         break
