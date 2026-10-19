@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class SchedulerSchema(BaseModel):
@@ -158,6 +158,16 @@ class RescheduleRequest(SchedulerSchema):
     current_timetable_id: int | None = Field(
         default=None, ge=1, description="ID of the timetable to update, if specified."
     )
+
+    @model_validator(mode="after")
+    def validate_trigger_details(self) -> RescheduleRequest:
+        if self.trigger_type == "FACULTY_LEAVE" and self.faculty_id is None:
+            raise ValueError("faculty_id is required for FACULTY_LEAVE")
+        if self.trigger_type == "ROOM_OUTAGE" and self.resource_id is None:
+            raise ValueError("resource_id is required for ROOM_OUTAGE")
+        if self.trigger_type == "EVENT_INSERTION" and self.event_details is None:
+            raise ValueError("event_details is required for EVENT_INSERTION")
+        return self
 
     @field_validator("slot_ids")
     @classmethod
