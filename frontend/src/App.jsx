@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import { ToastProvider } from "./context/ToastContext";
+import { TimetableProvider } from "./context/TimetableContext";
 import AppShell from "./components/layout/AppShell";
 import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
@@ -23,7 +24,8 @@ import NotFound from "./pages/NotFound";
 import { ROLES } from "./context/AuthContext";
 
 function RequireAuth({ children }) {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, initializing } = useAuth();
+  if (initializing) return null;
   if (!isAuthenticated) return <Navigate to="/login" replace />;
   return children;
 }
@@ -163,7 +165,9 @@ export default function App() {
     <BrowserRouter>
       <AuthProvider>
         <ToastProvider>
-          <AppRoutes />
+          <TimetableProvider>
+            <AppRoutes />
+          </TimetableProvider>
         </ToastProvider>
       </AuthProvider>
     </BrowserRouter>

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { GraduationCap, ShieldCheck, Users, BookUser, School } from "lucide-react";
 import { useAuth, ROLES } from "../context/AuthContext";
+import { USE_MOCK } from "../services/api";
 import { Field, Input } from "../components/ui/Field";
 import Button from "../components/ui/Button";
 
@@ -12,20 +13,27 @@ const ROLE_OPTIONS = [
 ];
 
 export default function Login() {
-  const { login } = useAuth();
+  const { signIn } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [selectedRole, setSelectedRole] = useState(ROLES.COORDINATOR);
   const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     if (!email.trim() || !password.trim()) {
       setError("Enter your institutional email and password to continue.");
       return;
     }
     setError("");
-    login(selectedRole);
+    setSubmitting(true);
+    try {
+      await signIn(email.trim(), password, selectedRole);
+    } catch (err) {
+      setError(err.message);
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -89,6 +97,7 @@ export default function Login() {
               </a>
             </div>
 
+            {USE_MOCK && (
             <div>
               <p className="text-xs font-medium text-ink mb-2">Continue as (demo role selector)</p>
               <div className="grid grid-cols-2 gap-2">
@@ -108,16 +117,17 @@ export default function Login() {
                 ))}
               </div>
             </div>
+            )}
 
-            <Button type="submit" className="w-full" size="lg">
-              Sign in as {selectedRole}
+            <Button type="submit" className="w-full" size="lg" disabled={submitting}>
+              {submitting ? "Signing in…" : USE_MOCK ? `Sign in as ${selectedRole}` : "Sign in"}
             </Button>
           </form>
 
           <p className="text-[11px] text-slate-400 mt-5 leading-relaxed">
-            This is a frontend demonstration. Authentication is mocked locally; a production
-            deployment will validate credentials against the institution's identity provider
-            over JWT-secured REST APIs.
+            {USE_MOCK
+              ? "Demo mode: authentication is mocked locally. Set VITE_USE_MOCK=false to sign in against the backend with JWT."
+              : "Signed in over JWT-secured REST APIs. Your role is assigned by the System Administrator."}
           </p>
         </div>
       </div>

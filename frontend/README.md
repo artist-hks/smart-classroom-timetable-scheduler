@@ -166,3 +166,21 @@ to be swapped for real REST calls without restructuring the UI:
   backend can be integrated later" rather than faking a write to static data.
 - Conflict "Mark resolved" and Notification "read" states are local to the
   component's React state and reset on reload.
+
+
+## 10. Backend integration (generate + timetable)
+
+Controlled by `.env` (see `.env.example`):
+
+| Variable | Purpose |
+|---|---|
+| `VITE_USE_MOCK` | `true` (default): built-in mock data, no backend. `false`: call the real API and sign in with JWT. |
+| `VITE_API_URL` | FastAPI base URL, e.g. `http://localhost:8000` |
+| `VITE_GENERATE_PATH` | Route for `GenerateTimetableRequest` -> `TimetableGenerationResponse` |
+
+- `src/services/api.js` — fetch wrapper: bearer token, one silent refresh retry, FastAPI error formatting.
+- `src/services/timetableService.js` — `generateTimetable(payload)`; mock or real.
+- `src/utils/timetableAdapter.js` — `AllocatedSessionResponse[]` -> `WeeklyGrid` sessions (ids resolved to names via `/api/v1/faculty`, `/sub-batches`, `/sections`).
+- `src/context/TimetableContext.jsx` — shares the last generation between Generate & Optimize and Timetable.
+
+**Backend gap:** `app/schemas/scheduler.py` defines the request/response models and `scheduler_service.py` runs the engines, but no HTTP route exposes them yet, and there is no endpoint to fetch published/draft timetables or versions. Until the route exists, real mode shows a "Generation endpoint not found" error with a Retry button.
