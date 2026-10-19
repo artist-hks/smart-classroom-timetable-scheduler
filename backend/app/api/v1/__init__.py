@@ -1,4 +1,4 @@
-"""Aggregates every /api/v1 router (SB2/US3-US6 CRUD APIs)."""
+"""Aggregates every /api/v1 router (SB2/US3-US6 CRUD APIs, SB3/US5 timetable generation)."""
 
 from fastapi import APIRouter
 
@@ -12,6 +12,7 @@ from app.api.v1.academic import (
 from app.api.v1.faculty import router as faculty_router
 from app.api.v1.resources import router as resources_router
 from app.api.v1.scheduling_config import breaks_router, timeslots_router
+from app.api.v1.timetable import router as timetable_router
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(departments_router)
@@ -23,3 +24,4 @@ api_router.include_router(faculty_router)
 api_router.include_router(resources_router)
 api_router.include_router(timeslots_router)
 api_router.include_router(breaks_router)
+api_router.include_router(timetable_router)
