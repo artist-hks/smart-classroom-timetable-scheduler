@@ -486,6 +486,16 @@ class TimetableGAOptimizer:
 
         return (round(composite_score, 5),)
 
+    def _select_tournament(self, individuals: list[Any], k: int, tournsize: int) -> list[Any]:
+        """Tournament selection using this optimizer's seeded RNG."""
+        if not individuals:
+            return []
+        sample_size = min(tournsize, len(individuals))
+        return [
+            max(self.rng.sample(individuals, sample_size), key=lambda individual: individual.fitness)
+            for _ in range(k)
+        ]
+
     # -----------------------------------------------------------------------
     # Genetic Operators: Mutation, Crossover, Repair
     # -----------------------------------------------------------------------
@@ -545,7 +555,7 @@ class TimetableGAOptimizer:
         """
         size = min(len(ind1), len(ind2))
         for i in range(size):
-            if random.random() < 0.5:
+            if self.rng.random() < 0.5:
                 # Attempt gene swap
                 orig1 = copy.deepcopy(ind1[i])
                 orig2 = copy.deepcopy(ind2[i])
@@ -627,7 +637,7 @@ class TimetableGAOptimizer:
         toolbox.register("evaluate", self.evaluate_fitness)
         toolbox.register("mate", self.crossover_individuals)
         toolbox.register("mutate", self.mutate_individual)
-        toolbox.register("select", tools.selTournament, tournsize=self.config.tournament_size)
+        toolbox.register("select", self._select_tournament, tournsize=self.config.tournament_size)
 
         # Initialize Population
         pop = toolbox.population(n=self.config.population_size)
