@@ -19,6 +19,9 @@ from app.algorithms.session_generator import GeneratedSession, ParticipantGroupS
 from app.algorithms.timeslot_grid import GridSlot, ScheduleGrid
 from app.models.academic import ResourceType
 
+DEFAULT_CP_SAT_TIME_LIMIT_SECONDS = 30.0
+DEFAULT_CP_SAT_NUM_WORKERS = 4
+
 
 @dataclass
 class FacultySpec:
@@ -27,6 +30,7 @@ class FacultySpec:
     name: str
     max_weekly_hours: float = 16.0
     unavailable_slot_ids: set[int] = field(default_factory=set)
+    preferred_slot_ids: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -48,6 +52,7 @@ class ScheduledAssignment:
     department_id: int = 1
     required_resource_type: ResourceType | None = None
     required_capacity: int = 0
+    required_equipment: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -75,12 +80,14 @@ class CPSATScheduler:
         participant_groups: dict[int, ParticipantGroupSpec],
         faculty_members: dict[int, FacultySpec],
         reserved_slot_ids: set[int] | None = None,
+        num_workers: int = DEFAULT_CP_SAT_NUM_WORKERS,
     ):
         self.grid = grid
         self.sessions = list(sessions)
         self.participant_groups = participant_groups
         self.faculty_members = faculty_members
         self.reserved_slot_ids = reserved_slot_ids or set()
+        self.num_workers = max(1, int(num_workers))
 
     def run_prechecks(self) -> list[str]:
         """
@@ -107,7 +114,7 @@ class CPSATScheduler:
         available_operational_slots = [
             s for s in self.grid.slots if not s.is_break and s.slot_id not in self.reserved_slot_ids
         ]
-        total_available_periods = len(available_operational_slots)
+        total_available_hours = sum(slot.duration_minutes for slot in available_operational_slots) / 60.0
 
         subbatch_hours: dict[int, float] = {}
         for s in self.sessions:
@@ -117,14 +124,23 @@ class CPSATScheduler:
                     subbatch_hours[sbid] = subbatch_hours.get(sbid, 0.0) + s.duration_hours
 
         for sbid, hours in subbatch_hours.items():
-            if hours > total_available_periods:
+            if hours > total_available_hours:
                 diagnostics.append(
                     f"HC-03/04 Infeasibility: Sub-batch ID {sbid} requires {hours:.1f} contact hours, "
-                    f"but only {total_available_periods} total slots exist on the grid."
+                    f"but only {total_available_hours:.1f} operational hours exist on the grid."
                 )
 
         # 3. Check Session valid slot availability
         for s in self.sessions:
+            if s.duration_minutes <= 0:
+                diagnostics.append(f"HC-14 Infeasibility: Session '{s.label}' must have a positive duration.")
+            if s.participant_group_id not in self.participant_groups:
+                diagnostics.append(f"HC-13 Infeasibility: Session '{s.label}' references unknown participant group {s.participant_group_id}.")
+            elif not self.participant_groups[s.participant_group_id].subbatch_ids:
+                diagnostics.append(f"HC-13 Infeasibility: Session '{s.label}' has no valid participant sub-batches.")
+            if any(fid not in self.faculty_members for fid in s.faculty_ids):
+                missing = sorted(set(s.faculty_ids) - set(self.faculty_members))
+                diagnostics.append(f"HC-01/05 Infeasibility: Session '{s.label}' references unknown faculty IDs {missing}.")
             valid_starts = self.grid.get_valid_start_slots_for_duration(s.duration_minutes)
             if not valid_starts:
                 diagnostics.append(
@@ -134,11 +150,16 @@ class CPSATScheduler:
 
         return diagnostics
 
-    def solve(self, time_limit_seconds: float = 30.0) -> CPSATSolverResult:
+    def solve(self, time_limit_seconds: float = DEFAULT_CP_SAT_TIME_LIMIT_SECONDS) -> CPSATSolverResult:
         """
         Executes Google OR-Tools CP-SAT solver to find a conflict-free feasible schedule.
         """
         start_time = time.perf_counter()
+
+        if not self.sessions:
+            return CPSATSolverResult(True, "FEASIBLE", time.perf_counter() - start_time, 0)
+        if time_limit_seconds <= 0:
+            return CPSATSolverResult(False, "INVALID_CONFIGURATION", 0.0, 0, diagnostics=["time_limit_seconds must be positive."])
 
         # Run pre-checks
         pre_diagnostics = self.run_prechecks()
@@ -262,7 +283,7 @@ class CPSATScheduler:
         # -------------------------------------------------------------------
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = time_limit_seconds
-        solver.parameters.num_workers = 4  # parallel solver workers
+        solver.parameters.num_workers = self.num_workers
 
         status = solver.Solve(model)
         elapsed = time.perf_counter() - start_time
@@ -294,6 +315,7 @@ class CPSATScheduler:
                             department_id=s.department_id,
                             required_resource_type=s.required_resource_type,
                             required_capacity=s.required_capacity if s.required_capacity > 0 else (pg.combined_strength if pg else 0),
+                            required_equipment=dict(getattr(s, "required_equipment", {}) or {}),
                         )
                         assignments.append(assignment)
                         break
@@ -313,11 +335,11 @@ class CPSATScheduler:
         else:
             return CPSATSolverResult(
                 is_feasible=False,
-                status_label="INFEASIBLE",
+                status_label=solver.StatusName(status),
                 solve_time_seconds=elapsed,
                 total_sessions_scheduled=0,
                 diagnostics=[
-                    "CP-SAT solver exhausted search space without finding a conflict-free assignment.",
+                    f"CP-SAT ended with status {solver.StatusName(status)} without finding a conflict-free assignment.",
                     "Potential causes: High constraint density between shared faculty, overlapping sub-batch practicals, or tight slot bounds.",
                 ],
             )

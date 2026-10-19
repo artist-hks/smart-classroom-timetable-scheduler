@@ -152,6 +152,11 @@ class CourseToSessionGenerator:
         """
         generated_sessions: list[GeneratedSession] = []
 
+        if any(int(cfg.get("sessions_per_week", 0)) < 0 or int(cfg.get("duration_minutes", 0)) <= 0 for cfg in configs):
+            raise ValueError("Session configurations require non-negative sessions_per_week and positive duration_minutes.")
+        if configs and not section_groups:
+            raise ValueError("At least one participant group is required to generate sessions.")
+
         for cfg in configs:
             stype: SessionType = cfg["session_type"]
             cst_id: int = cfg["course_session_type_id"]
@@ -159,14 +164,16 @@ class CourseToSessionGenerator:
             duration_minutes: int = cfg["duration_minutes"]
             res_type: ResourceType | None = cfg.get("required_resource_type")
 
-            if stype == SessionType.LECTURE or stype == SessionType.TUTE_ASSIGNMENT or stype == SessionType.SEMINAR:
+            if stype in (SessionType.LECTURE, SessionType.TUTE_ASSIGNMENT, SessionType.SEMINAR, SessionType.EVENT):
                 # Typically whole-section or designated group
                 pgroup = section_groups.get("lecture") or section_groups.get("main")
                 if not pgroup:
                     # Fallback to the first available group
-                    pgroup = next(iter(section_groups.values()))
+                    pgroup = next(iter(section_groups.values()), None)
+                if not pgroup:
+                    raise ValueError(f"No participant group configured for {course_code} {stype.value}.")
                 
-                faculty_ids = faculty_mapping.get("lecture") or faculty_mapping.get("main") or []
+                faculty_ids = faculty_mapping.get("event" if stype == SessionType.EVENT else "lecture") or faculty_mapping.get("main") or []
 
                 for i in range(1, sessions_per_week + 1):
                     session = GeneratedSession(
@@ -176,9 +183,13 @@ class CourseToSessionGenerator:
                         department_id=department_id,
                         session_type=stype,
                         duration_minutes=duration_minutes,
-                        required_resource_type=res_type or ResourceType.CLASSROOM,
+                        required_resource_type=res_type or (
+                            ResourceType.SEMINAR_HALL
+                            if stype in (SessionType.SEMINAR, SessionType.EVENT)
+                            else ResourceType.CLASSROOM
+                        ),
                         required_capacity=pgroup.combined_strength,
-                        participant_group_id=pgroup.participant_group_id or 0,
+                        participant_group_id=pgroup.participant_group_id if pgroup.participant_group_id is not None else 0,
                         faculty_ids=faculty_ids,
                         status=SessionStatus.DRAFT,
                         label=f"{course_code}_{stype.value}_S{i}",
@@ -195,7 +206,10 @@ class CourseToSessionGenerator:
                 
                 if not lab_groups:
                     # Fallback: single group
-                    lab_groups = {"default_lab": next(iter(section_groups.values()))}
+                    first_group = next(iter(section_groups.values()), None)
+                    if first_group is None:
+                        raise ValueError(f"No participant group configured for {course_code} practical sessions.")
+                    lab_groups = {"default_lab": first_group}
 
                 for group_key, pgroup in lab_groups.items():
                     faculty_ids = faculty_mapping.get(group_key) or faculty_mapping.get("lab") or faculty_mapping.get("main") or []
@@ -209,11 +223,14 @@ class CourseToSessionGenerator:
                             duration_minutes=duration_minutes,
                             required_resource_type=res_type or ResourceType.LABORATORY,
                             required_capacity=pgroup.combined_strength,
-                            participant_group_id=pgroup.participant_group_id or 0,
+                            participant_group_id=pgroup.participant_group_id if pgroup.participant_group_id is not None else 0,
                             faculty_ids=faculty_ids,
                             status=SessionStatus.DRAFT,
                             label=f"{course_code}_{stype.value}_{pgroup.label}_S{i}",
                         )
                         generated_sessions.append(session)
+
+            else:
+                raise ValueError(f"Unsupported session type {stype!r} for course {course_code}.")
 
         return generated_sessions

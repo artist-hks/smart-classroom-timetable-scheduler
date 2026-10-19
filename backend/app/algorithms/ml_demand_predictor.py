@@ -172,7 +172,7 @@ class RoomDemandPredictor:
             max_depth=12,
             min_samples_split=4,
             random_state=42,
-            n_jobs=-1,
+            n_jobs=1,
         )
         self.is_trained = False
         self.metadata: MLModelMetadata | None = None
@@ -189,6 +189,8 @@ class RoomDemandPredictor:
         If X and y are not provided, automatically synthesizes the training dataset.
         """
         if X is None or y is None:
+            if X is not None or y is not None:
+                raise ValueError("X and y must either both be provided or both be omitted.")
             X, y, feature_names = MLDemandDatasetGenerator.generate_simulated_dataset(
                 n_samples=2500, random_seed=random_seed
             )
@@ -196,6 +198,15 @@ class RoomDemandPredictor:
         else:
             feature_names = MLDemandDatasetGenerator.FEATURE_NAMES
             data_source = "INSTITUTIONAL_OR_CUSTOM_SUPPLIED (FR-3.7.2)"
+
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        if X.ndim != 2 or y.ndim != 1 or len(X) != len(y) or X.shape[1] != len(feature_names):
+            raise ValueError("X and y must have matching rows and the expected feature count.")
+        if len(X) < 2 or not np.isfinite(X).all() or not np.isfinite(y).all():
+            raise ValueError("Training data must contain at least two finite samples.")
+        if not 0 < test_size < 1:
+            raise ValueError("test_size must be between 0 and 1.")
 
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_seed
@@ -322,6 +333,8 @@ class RoomDemandPredictor:
 
     def load_model(self, filepath: str) -> None:
         """Loads a serialized model and its metadata from disk."""
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(filepath)
         with open(filepath, "rb") as f:
             data = pickle.load(f)
             self.model = data["model"]

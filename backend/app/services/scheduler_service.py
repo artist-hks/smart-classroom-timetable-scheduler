@@ -43,6 +43,16 @@ from app.algorithms.session_generator import (
 from app.algorithms.timeslot_grid import GridSlot, ScheduleGrid
 from app.models.academic import ResourceType, SessionType
 
+DEFAULT_GRID_DAYS = 5
+DEFAULT_PERIODS_PER_DAY = 7
+DEFAULT_PERIOD_DURATION_MINUTES = 60
+DEFAULT_LUNCH_PERIOD_INDEX = 4
+DEFAULT_SOLVER_TIME_LIMIT_SECONDS = 15.0
+DEFAULT_GA_TIME_LIMIT_SECONDS = 15.0
+DEFAULT_DEMAND_DEPARTMENT_ID = 1
+DEFAULT_DEMAND_SEMESTER = 5
+DEFAULT_DEMAND_STRENGTH = 60
+
 
 class TimetableSchedulerService:
     """
@@ -51,15 +61,15 @@ class TimetableSchedulerService:
 
     @staticmethod
     def create_piet_standard_grid(
-        days: int = 5,
-        periods_per_day: int = 7,
-        lunch_period_index: int = 4,
+        days: int = DEFAULT_GRID_DAYS,
+        periods_per_day: int = DEFAULT_PERIODS_PER_DAY,
+        lunch_period_index: int = DEFAULT_LUNCH_PERIOD_INDEX,
     ) -> ScheduleGrid:
         """Create standard PIET college weekly schedule grid."""
         return ScheduleGrid.create_standard_piet_grid(
             days=days,
             periods_per_day=periods_per_day,
-            period_duration_minutes=60,
+            period_duration_minutes=DEFAULT_PERIOD_DURATION_MINUTES,
             lunch_period_index=lunch_period_index,
         )
 
@@ -100,7 +110,7 @@ class TimetableSchedulerService:
         participant_groups: dict[int, ParticipantGroupSpec],
         faculty_members: dict[int, FacultySpec],
         reserved_slot_ids: set[int] | None = None,
-        time_limit_seconds: float = 15.0,
+        time_limit_seconds: float = DEFAULT_SOLVER_TIME_LIMIT_SECONDS,
     ) -> CPSATSolverResult:
         """
         Runs the Google OR-Tools CP-SAT scheduler on generated sessions.
@@ -121,6 +131,8 @@ class TimetableSchedulerService:
         predicted_demand: dict[tuple[int, int, int], float] | None = None,
         session_equipment: dict[int, dict[str, int]] | None = None,
         preferred_building: str | None = None,
+        weights: dict[str, float] | None = None,
+        max_revalidation_attempts: int = 3,
     ) -> ResourceAllocationResult:
         """
         Runs Smart Resource Allocation & Mandatory Validation (Engine 2).
@@ -130,11 +142,13 @@ class TimetableSchedulerService:
         allocator = SmartResourceAllocator(
             resources=resources,
             predicted_demand=predicted_demand,
+            weights=weights,
         )
         return allocator.allocate_and_validate(
             assignments=assignments,
             session_equipment=session_equipment,
             preferred_building=preferred_building,
+            max_revalidation_attempts=max_revalidation_attempts,
         )
 
     @staticmethod
@@ -144,7 +158,9 @@ class TimetableSchedulerService:
         resources: Sequence[ResourceSpec],
         faculty_members: dict[int, FacultySpec] | None = None,
         config: GAOptimizationConfig | None = None,
-        max_time_seconds: float = 15.0,
+        max_time_seconds: float = DEFAULT_GA_TIME_LIMIT_SECONDS,
+        participant_groups: dict[int, ParticipantGroupSpec] | None = None,
+        reserved_slot_ids: set[int] | None = None,
     ) -> GAOptimizationResult:
         """
         Runs Genetic Algorithm (GA) Optimization (Engine 3).
@@ -156,6 +172,8 @@ class TimetableSchedulerService:
             resources=resources,
             faculty_members=faculty_members,
             config=config,
+            participant_groups=participant_groups,
+            reserved_slot_ids=reserved_slot_ids,
         )
         return optimizer.optimize(allocations=allocations, max_time_seconds=max_time_seconds)
 
@@ -167,6 +185,8 @@ class TimetableSchedulerService:
         resources: Sequence[ResourceSpec],
         faculty_members: dict[int, FacultySpec],
         substitute_faculty_pool: dict[int, list[int]] | None = None,
+        participant_groups: dict[int, ParticipantGroupSpec] | None = None,
+        reserved_slot_ids: set[int] | None = None,
     ) -> ReschedulingResult:
         """
         Runs Dynamic Rescheduling Engine (Engine 4).
@@ -178,6 +198,8 @@ class TimetableSchedulerService:
             resources=resources,
             faculty_members=faculty_members,
             substitute_faculty_pool=substitute_faculty_pool,
+            participant_groups=participant_groups,
+            reserved_slot_ids=reserved_slot_ids,
         )
         return rescheduler.resolve_rescheduling(
             current_schedule=current_schedule,
@@ -188,9 +210,11 @@ class TimetableSchedulerService:
     def predict_room_demand_matrix(
         grid: ScheduleGrid,
         resources: Sequence[ResourceSpec],
-        department_id: int = 1,
-        semester: int = 5,
+        department_id: int = DEFAULT_DEMAND_DEPARTMENT_ID,
+        semester: int = DEFAULT_DEMAND_SEMESTER,
         model_version: str = "v1.0.0-piet-simulated",
+        X: Any | None = None,
+        y: Any | None = None,
     ) -> tuple[dict[tuple[int, int, int], float], MLModelMetadata]:
         """
         Runs ML Room Demand Prediction Engine.
@@ -198,12 +222,13 @@ class TimetableSchedulerService:
         the (resource_id, day, slot_id) -> demand_score matrix for Smart Resource Allocation.
         """
         predictor = RoomDemandPredictor(model_version=model_version)
-        metadata = predictor.train_and_evaluate()
+        metadata = predictor.train_and_evaluate(X=X, y=y)
         matrix = predictor.generate_demand_matrix(
             grid=grid,
             resources=resources,
             department_id=department_id,
             semester=semester,
+            default_strength=DEFAULT_DEMAND_STRENGTH,
         )
         return matrix, metadata
 

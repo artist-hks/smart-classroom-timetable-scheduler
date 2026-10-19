@@ -46,6 +46,7 @@ class SessionGene:
     department_id: int
     required_capacity: int
     required_resource_type: ResourceType | None
+    required_equipment: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -63,8 +64,13 @@ class GAOptimizationConfig:
         "sc02_workload": 0.20,         # SC-02: Faculty workload balance / variance
         "sc03_gaps": 0.25,             # SC-03: Student idle gap minimization
         "sc04_distribution": 0.15,     # SC-04: Daily session distribution across days
+        "sc05_faculty_preference": 0.05, # SC-05: Faculty slot preference when provided
         "sc06_suitability": 0.10,      # SC-06: Room suitability & equipment fit
+        "sc07_room_switching": 0.05,    # SC-07: Minimize course room switching
+        "sc08_reschedule_changes": 0.0, # SC-08: Reschedule-only objective
+        "sc09_reschedule_faculty_preference": 0.0, # SC-09: Reschedule-only preference objective
         "sc10_stability": 0.10,        # SC-10: Resource stability across recurring course sessions
+        "sc11_grouping_efficiency": 0.05, # SC-11: Participant grouping efficiency
     })
 
 
@@ -121,6 +127,8 @@ class TimetableGAOptimizer:
         resources: Sequence[ResourceSpec],
         faculty_members: dict[int, FacultySpec] | None = None,
         config: GAOptimizationConfig | None = None,
+        participant_groups: dict[int, Any] | None = None,
+        reserved_slot_ids: set[int] | None = None,
     ):
         _init_deap()
         self.grid = grid
@@ -128,17 +136,37 @@ class TimetableGAOptimizer:
         self.resources_by_id = {r.resource_id: r for r in self.resources}
         self.faculty_members = faculty_members or {}
         self.config = config or GAOptimizationConfig()
-
-        if self.config.random_seed is not None:
-            random.seed(self.config.random_seed)
+        self.participant_groups = participant_groups or {}
+        self.reserved_slot_ids = reserved_slot_ids or set()
+        self.rng = random.Random(self.config.random_seed)
+        if self.config.population_size < 1 or self.config.num_generations < 0 or self.config.tournament_size < 1:
+            raise ValueError("GA population_size and tournament_size must be positive; num_generations cannot be negative.")
+        if not 0 <= self.config.crossover_probability <= 1 or not 0 <= self.config.mutation_probability <= 1:
+            raise ValueError("GA probabilities must be between 0 and 1.")
 
         # Normalize soft-constraint weights
-        total_w = sum(self.config.weights.values())
-        self.weights = {k: v / total_w for k, v in self.config.weights.items()}
+        default_weights = GAOptimizationConfig().weights
+        raw_weights = {**default_weights, **self.config.weights}
+        if set(raw_weights) != set(default_weights):
+            raise ValueError(f"Unknown GA scoring weights: {sorted(set(raw_weights) - set(default_weights))}")
+        if any(not math.isfinite(float(v)) or float(v) < 0 for v in raw_weights.values()):
+            raise ValueError("GA weights must be finite and non-negative.")
+        total_w = sum(raw_weights.values())
+        if total_w <= 0:
+            raise ValueError("At least one GA weight must be positive.")
+        self.weights = {k: v / total_w for k, v in raw_weights.items()}
 
         # Precompute valid start slots for durations (60m, 120m, etc.)
         self.valid_starts_by_duration: dict[int, list[int]] = {}
-        durations = {60, 120, 180}
+        durations: set[int] = set()
+        for day_slots in self.grid.slots_by_day.values():
+            for start_idx, start_slot in enumerate(day_slots):
+                total_minutes = 0
+                for slot in day_slots[start_idx:]:
+                    if slot.is_break:
+                        break
+                    total_minutes += slot.duration_minutes
+                    durations.add(total_minutes)
         for d in durations:
             self.valid_starts_by_duration[d] = self.grid.get_valid_start_slots_for_duration(d)
 
@@ -225,10 +253,9 @@ class TimetableGAOptimizer:
                     min_p = min(periods)
                     max_p = max(periods)
                     # Check how many periods between min_p and max_p are idle (excluding lunch)
+                    operational = {slot.period for slot in self.grid.slots_by_day.get(day, []) if not slot.is_break}
                     for p in range(min_p + 1, max_p):
-                        if p not in periods:
-                            # Verify if period p was an operational slot (not break)
-                            # Standard lunch break is usually period 4
+                        if p in operational and p not in periods:
                             total_gaps += 1
 
         score = 1.0 / (1.0 + (total_gaps * 0.1))
@@ -271,10 +298,39 @@ class TimetableGAOptimizer:
             # Exact type match
             match = 1.0 if (gene.required_resource_type is None or res.resource_type == gene.required_resource_type) else 0.0
             # Equipment bonus
-            has_aid = any(k in res.equipment for k in ("projector", "smart board", "display"))
+            equipment_ok = all(res.equipment.get(k.strip().lower(), 0) >= qty for k, qty in gene.required_equipment.items())
+            has_aid = any(res.equipment.get(k, 0) > 0 for k in ("projector", "smart board", "display"))
             bonus = 0.2 if has_aid else 0.0
-            scores.append(min(1.0, match * 0.8 + bonus))
+            scores.append(min(1.0, match * 0.8 + bonus) if equipment_ok else 0.0)
         return sum(scores) / len(scores) if scores else 0.8
+
+    def evaluate_sc05_faculty_preference(self, individual: list[SessionGene]) -> float:
+        applicable = [(gene, self.faculty_members[fid]) for gene in individual for fid in gene.faculty_ids
+                      if fid in self.faculty_members and self.faculty_members[fid].preferred_slot_ids]
+        if not applicable:
+            return 1.0
+        return sum(all(slot_id in faculty.preferred_slot_ids for slot_id in gene.occupied_slot_ids)
+                   for gene, faculty in applicable) / len(applicable)
+
+    def evaluate_sc07_room_switching(self, individual: list[SessionGene]) -> float:
+        return self.evaluate_sc10_resource_stability(individual)
+
+    def evaluate_sc08_reschedule_changes(self, individual: list[SessionGene]) -> float:
+        return 1.0
+
+    def evaluate_sc09_reschedule_faculty_preference(self, individual: list[SessionGene]) -> float:
+        return self.evaluate_sc05_faculty_preference(individual)
+
+    def evaluate_sc11_grouping_efficiency(self, individual: list[SessionGene]) -> float:
+        if not individual:
+            return 1.0
+        audience_sizes = [len(set(g.subbatch_ids)) for g in individual if g.subbatch_ids]
+        if not audience_sizes:
+            return 0.0
+        max_group_size = max(audience_sizes)
+        if max_group_size <= 1:
+            return 1.0
+        return sum(size / max_group_size for size in audience_sizes) / len(audience_sizes)
 
     def evaluate_sc10_resource_stability(self, individual: list[SessionGene]) -> float:
         """
@@ -307,9 +363,30 @@ class TimetableGAOptimizer:
         faculty_time: dict[tuple[int, int], int] = {}
         subbatch_time: dict[tuple[int, int], int] = {}
         resource_time: dict[tuple[int, int], int] = {}
+        faculty_hours: dict[int, float] = {}
 
         for gene in individual:
             res = self.resources_by_id.get(gene.resource_id)
+
+            if gene.start_slot_id not in self.grid.slot_by_id:
+                violations += 1
+                continue
+            try:
+                expected_slots = self.grid.get_occupied_slots(gene.start_slot_id, gene.duration_minutes)
+                if expected_slots != gene.occupied_slot_ids or self.grid.slot_by_id[gene.start_slot_id].day != gene.day:
+                    violations += 1
+            except (KeyError, StopIteration, IndexError, ValueError):
+                violations += 1
+                continue
+            if not gene.subbatch_ids or len(set(gene.subbatch_ids)) != len(gene.subbatch_ids):
+                violations += 1
+            if any(slot_id in self.reserved_slot_ids for slot_id in gene.occupied_slot_ids):
+                violations += 1
+            if gene.participant_group_id in self.participant_groups:
+                if set(gene.subbatch_ids) != set(self.participant_groups[gene.participant_group_id].subbatch_ids):
+                    violations += 1
+            elif self.participant_groups:
+                violations += 1
 
             # Capacity check (HC-07, HC-16)
             if not res or res.capacity < gene.required_capacity:
@@ -322,10 +399,16 @@ class TimetableGAOptimizer:
             # Inactive room check (HC-06)
             if res and not res.is_active:
                 violations += 1
+            if res and res.department_id is not None and res.department_id != gene.department_id:
+                violations += 1
+            if res and any(res.equipment.get(name.strip().lower(), 0) < quantity
+                           for name, quantity in gene.required_equipment.items()):
+                violations += 1
 
             for slot_id in gene.occupied_slot_ids:
                 # Faculty Clash (HC-01)
                 for fid in gene.faculty_ids:
+                    faculty_hours[fid] = faculty_hours.get(fid, 0.0) + gene.duration_minutes / 60.0 / max(1, len(gene.occupied_slot_ids))
                     fac_key = (fid, slot_id)
                     if fac_key in faculty_time:
                         violations += 1
@@ -356,6 +439,11 @@ class TimetableGAOptimizer:
                 if res and slot_id in res.unavailable_slot_ids:
                     violations += 1
 
+        for fid, hours in faculty_hours.items():
+            faculty = self.faculty_members.get(fid)
+            if faculty and hours > faculty.max_weekly_hours:
+                violations += 1
+
         return violations
 
     def evaluate_fitness(self, individual: list[SessionGene]) -> tuple[float]:
@@ -374,16 +462,26 @@ class TimetableGAOptimizer:
         s_workload, _ = self.evaluate_sc02_workload_balance(individual)
         s_gaps, _ = self.evaluate_sc03_student_gaps(individual)
         s_dist = self.evaluate_sc04_daily_distribution(individual)
+        s_pref = self.evaluate_sc05_faculty_preference(individual)
         s_suit = self.evaluate_sc06_room_suitability(individual)
+        s_switch = self.evaluate_sc07_room_switching(individual)
+        s_resched = self.evaluate_sc08_reschedule_changes(individual)
+        s_resched_pref = self.evaluate_sc09_reschedule_faculty_preference(individual)
         s_stab = self.evaluate_sc10_resource_stability(individual)
+        s_group = self.evaluate_sc11_grouping_efficiency(individual)
 
         composite_score = (
             self.weights["sc01_utilization"] * s_util
             + self.weights["sc02_workload"] * s_workload
             + self.weights["sc03_gaps"] * s_gaps
             + self.weights["sc04_distribution"] * s_dist
+            + self.weights["sc05_faculty_preference"] * s_pref
             + self.weights["sc06_suitability"] * s_suit
+            + self.weights["sc07_room_switching"] * s_switch
+            + self.weights["sc08_reschedule_changes"] * s_resched
+            + self.weights["sc09_reschedule_faculty_preference"] * s_resched_pref
             + self.weights["sc10_stability"] * s_stab
+            + self.weights["sc11_grouping_efficiency"] * s_group
         )
 
         return (round(composite_score, 5),)
@@ -402,17 +500,17 @@ class TimetableGAOptimizer:
         if not individual:
             return (individual,)
 
-        idx = random.randint(0, len(individual) - 1)
+        idx = self.rng.randint(0, len(individual) - 1)
         original_gene = copy.deepcopy(individual[idx])
         gene = individual[idx]
 
         # Coin toss: mutate time slot or mutate room
-        mutation_type = random.choice(["time_slot", "room", "both"])
+        mutation_type = self.rng.choice(["time_slot", "room", "both"])
 
         if mutation_type in ("time_slot", "both"):
-            valid_starts = self.valid_starts_by_duration.get(gene.duration_minutes, [])
+            valid_starts = self.grid.get_valid_start_slots_for_duration(gene.duration_minutes)
             if valid_starts:
-                new_start = random.choice(valid_starts)
+                new_start = self.rng.choice(valid_starts)
                 new_occ = self.grid.get_occupied_slots(new_start, gene.duration_minutes)
                 gene.start_slot_id = new_start
                 gene.occupied_slot_ids = new_occ
@@ -425,9 +523,10 @@ class TimetableGAOptimizer:
                 r for r in self.resources_by_type.get(req_type, [])
                 if r.capacity >= gene.required_capacity
                 and (r.department_id is None or r.department_id == gene.department_id)
+                and all(r.equipment.get(name.strip().lower(), 0) >= quantity for name, quantity in gene.required_equipment.items())
             ]
             if candidates:
-                chosen_room = random.choice(candidates)
+                chosen_room = self.rng.choice(candidates)
                 gene.resource_id = chosen_room.resource_id
 
         # Safety Check: If mutation created an unrepairable hard-constraint clash, revert!
@@ -480,6 +579,11 @@ class TimetableGAOptimizer:
 
         # Convert input AllocatedSession list to baseline SessionGene list
         baseline_genes: list[SessionGene] = []
+        if max_time_seconds <= 0:
+            return GAOptimizationResult(False, "INVALID_CONFIGURATION", diagnostics=["max_time_seconds must be positive."])
+        if not allocations:
+            return GAOptimizationResult(True, "OPTIMIZED", optimized_allocations=[], diagnostics=[])
+
         for idx, a in enumerate(allocations):
             gene = SessionGene(
                 session_idx=idx,
@@ -498,11 +602,19 @@ class TimetableGAOptimizer:
                 department_id=a.department_id,
                 required_capacity=a.required_capacity,
                 required_resource_type=a.required_resource_type,
+                required_equipment=dict(a.required_equipment),
             )
             baseline_genes.append(gene)
 
         # Calculate Initial Metrics
         init_violations = self.count_hard_constraint_violations(baseline_genes)
+        if init_violations:
+            return GAOptimizationResult(
+                False,
+                "SAFETY_VIOLATION",
+                optimized_allocations=list(allocations),
+                diagnostics=[f"Input schedule has {init_violations} hard-constraint violation(s); optimization was not run."],
+            )
         init_fit = self.evaluate_fitness(baseline_genes)[0]
         init_util = self.evaluate_sc01_utilization(baseline_genes)
         _, init_var = self.evaluate_sc02_workload_balance(baseline_genes)
@@ -523,7 +635,7 @@ class TimetableGAOptimizer:
         # Seed population: Individual 0 is baseline; others receive safe exploratory mutations
         pop[0] = creator.Individual(copy.deepcopy(baseline_genes))
         for i in range(1, len(pop)):
-            for _ in range(random.randint(1, 4)):
+            for _ in range(self.rng.randint(1, 4)):
                 self.mutate_individual(pop[i])
 
         # Evaluate initial population fitnesses
@@ -549,14 +661,14 @@ class TimetableGAOptimizer:
 
             # Apply Crossover
             for child1, child2 in zip(offspring[::2], offspring[1::2]):
-                if random.random() < self.config.crossover_probability:
+                if self.rng.random() < self.config.crossover_probability:
                     toolbox.mate(child1, child2)
                     del child1.fitness.values
                     del child2.fitness.values
 
             # Apply Mutation
             for mutant in offspring:
-                if random.random() < self.config.mutation_probability:
+                if self.rng.random() < self.config.mutation_probability:
                     toolbox.mutate(mutant)
                     del mutant.fitness.values
 
@@ -638,6 +750,7 @@ class TimetableGAOptimizer:
                 resource_type=res.resource_type,
                 resource_capacity=res.capacity,
                 resource_score=final_fit,
+                required_equipment=dict(gene.required_equipment),
             )
             optimized_allocations.append(alloc)
 

@@ -18,7 +18,7 @@ import datetime
 import enum
 from typing import Any, Sequence
 
-from app.algorithms.cpsat_solver import FacultySpec, ScheduledAssignment
+from app.algorithms.cpsat_solver import CPSATScheduler, FacultySpec, ScheduledAssignment
 from app.algorithms.resource_allocator import (
     AllocatedSession,
     ResourceSpec,
@@ -38,6 +38,9 @@ class RescheduleTriggerType(str, enum.Enum):
     ACADEMIC_EVENT = "ACADEMIC_EVENT"                 # Workshop, alumni talk, campus seminar
     SESSION_CANCELLATION = "SESSION_CANCELLATION"     # Class cancelled for holiday/event
     ADDITIONAL_SESSION = "ADDITIONAL_SESSION"         # Extra makeup lecture inserted
+    SECTION_REGROUPING = "SECTION_REGROUPING"
+    RESOURCE_REASSIGNMENT = "RESOURCE_REASSIGNMENT"
+    CONSTRAINT_MODIFICATION = "CONSTRAINT_MODIFICATION"
 
 
 @dataclass
@@ -133,6 +136,7 @@ class DynamicRescheduler:
         faculty_members: dict[int, FacultySpec],
         participant_groups: dict[int, ParticipantGroupSpec] | None = None,
         substitute_faculty_pool: dict[int, list[int]] | None = None,  # course_id -> list[faculty_id]
+        reserved_slot_ids: set[int] | None = None,
     ):
         self.grid = grid
         self.resources = list(resources)
@@ -140,6 +144,7 @@ class DynamicRescheduler:
         self.faculty_members = faculty_members
         self.participant_groups = participant_groups or {}
         self.substitute_pool = substitute_faculty_pool or {}
+        self.reserved_slot_ids = reserved_slot_ids or set()
 
     # -----------------------------------------------------------------------
     # Step 1: Trigger Detection & Affected Scoping (FR-3.9.1, FR-3.9.2)
@@ -201,6 +206,16 @@ class DynamicRescheduler:
                         elif ev_faculty and bool(set(session.faculty_ids) & ev_faculty):
                             is_affected = True
 
+                    elif trigger.trigger_type == RescheduleTriggerType.SESSION_CANCELLATION:
+                        is_affected = trigger.subbatch_id is None or trigger.subbatch_id in session.subbatch_ids
+
+                    elif trigger.trigger_type == RescheduleTriggerType.SECTION_REGROUPING:
+                        changed_subbatches = set((trigger.event_details or {}).get("subbatch_ids", []))
+                        is_affected = trigger.subbatch_id in session.subbatch_ids if trigger.subbatch_id is not None else bool(set(session.subbatch_ids) & changed_subbatches)
+
+                    elif trigger.trigger_type == RescheduleTriggerType.RESOURCE_REASSIGNMENT:
+                        is_affected = trigger.resource_id is None or session.resource_id == trigger.resource_id
+
                     # 4. Specific Sub-batch target
                     elif trigger.subbatch_id is not None:
                         if trigger.subbatch_id in session.subbatch_ids:
@@ -243,9 +258,18 @@ class DynamicRescheduler:
         Executes dynamic rescheduling by exploring and ranking alternative resolutions.
         Enforces 100% hard constraint validation on all proposed resolutions.
         """
+        if not trigger.slot_ids or any(slot_id not in self.grid.slot_by_id for slot_id in trigger.slot_ids):
+            empty_scope = self.compute_affected_scope(current_schedule, trigger)
+            return ReschedulingResult(False, "INVALID_TRIGGER", empty_scope, diagnostics=[
+                "Rescheduling trigger must reference at least one valid schedule slot."
+            ])
         scope = self.compute_affected_scope(current_schedule, trigger)
 
         if not scope.affected_sessions:
+            if trigger.trigger_type == RescheduleTriggerType.ADDITIONAL_SESSION:
+                return ReschedulingResult(False, "INFEASIBLE_MISSING_SESSION_SPEC", scope, diagnostics=[
+                    "Additional-session rescheduling requires a complete session specification and candidate participant group."
+                ])
             return ReschedulingResult(
                 is_successful=True,
                 status_label="NO_AFFECTED_SESSIONS",
@@ -254,6 +278,10 @@ class DynamicRescheduler:
             )
 
         resolutions: list[RescheduleResolution] = []
+
+        reduced_opt = self._try_reduced_solver_strategy(scope)
+        if reduced_opt:
+            resolutions.append(reduced_opt)
 
         # Build occupancy map of the UNAFFECTED (frozen) sessions
         # (day, slot_id) -> booked entities
@@ -310,6 +338,18 @@ class DynamicRescheduler:
             if event_opt:
                 resolutions.append(event_opt)
 
+        if trigger.trigger_type == RescheduleTriggerType.SESSION_CANCELLATION:
+            resolutions.append(self._build_cancellation_resolution(scope))
+
+        validated_resolutions: list[RescheduleResolution] = []
+        for resolution in resolutions:
+            errors = self._validate_resolution(resolution.resolved_allocations)
+            if errors:
+                resolution.diagnostics.extend(errors)
+            else:
+                validated_resolutions.append(resolution)
+        resolutions = validated_resolutions
+
         # Rank resolutions by disruption score (lower disruption = higher ranking)
         resolutions.sort(key=lambda r: (r.disruption_score, -r.stability_percentage))
 
@@ -324,6 +364,224 @@ class DynamicRescheduler:
             best_resolution=best_res,
             diagnostics=[] if is_successful else ["No conflict-free alternative resolution found on schedule grid."],
         )
+
+    def _build_cancellation_resolution(self, scope: AffectedScope) -> RescheduleResolution:
+        preserved = list(scope.unaffected_sessions)
+        changed = len(scope.affected_sessions)
+        total = len(preserved) + changed
+        stability = round(len(preserved) / total * 100.0, 2) if total else 100.0
+        audit = [RescheduleAuditEntry(
+            session_label=session.label,
+            trigger_type=scope.trigger.trigger_type.value,
+            reason=scope.trigger.reason or "Session cancelled",
+            old_day=session.day,
+            old_slot_ids=list(session.occupied_slot_ids),
+            old_start_time=session.start_time,
+            old_end_time=session.end_time,
+            old_resource_code=session.resource_code,
+            old_faculty_ids=list(session.faculty_ids),
+            new_day=session.day,
+            new_slot_ids=[],
+            new_start_time="",
+            new_end_time="",
+            new_resource_code="",
+            new_faculty_ids=[],
+        ) for session in scope.affected_sessions]
+        return RescheduleResolution(
+            resolution_id="RES_CANCEL",
+            title="Cancel Affected Sessions",
+            strategy_type="SESSION_CANCELLATION",
+            changed_sessions_count=changed,
+            stability_percentage=stability,
+            disruption_score=float(changed),
+            resolved_allocations=preserved,
+            audit_entries=audit,
+        )
+
+    def _try_reduced_solver_strategy(self, scope: AffectedScope) -> RescheduleResolution | None:
+        """Re-solve only affected sessions, allocate around frozen sessions, then validate the full result."""
+        group_specs: dict[int, ParticipantGroupSpec] = {}
+        generated: list[GeneratedSession] = []
+        try:
+            for assignment in scope.affected_sessions:
+                group = group_specs.get(assignment.participant_group_id)
+                if group is None:
+                    group_specs[assignment.participant_group_id] = ParticipantGroupSpec(
+                        participant_group_id=assignment.participant_group_id,
+                        department_id=assignment.department_id,
+                        label=f"Reschedule group {assignment.participant_group_id}",
+                        subbatch_ids=list(assignment.subbatch_ids),
+                        combined_strength=assignment.required_capacity,
+                    )
+                elif set(group.subbatch_ids) != set(assignment.subbatch_ids):
+                    return None
+                generated.append(GeneratedSession(
+                    session_id=assignment.session_id,
+                    course_id=assignment.course_id,
+                    course_session_type_id=0,
+                    department_id=assignment.department_id,
+                    session_type=SessionType(assignment.session_type),
+                    duration_minutes=assignment.duration_minutes,
+                    required_resource_type=assignment.required_resource_type,
+                    required_capacity=assignment.required_capacity,
+                    participant_group_id=assignment.participant_group_id,
+                    faculty_ids=list(assignment.faculty_ids),
+                    label=assignment.label,
+                    required_equipment=dict(assignment.required_equipment),
+                ))
+        except (ValueError, TypeError):
+            return None
+
+        frozen_slot_ids = {
+            sid for session in scope.unaffected_sessions for sid in session.occupied_slot_ids
+        }
+        reserved = set(self.reserved_slot_ids)
+        if scope.trigger.trigger_type == RescheduleTriggerType.ACADEMIC_EVENT:
+            reserved.update(scope.trigger.slot_ids)
+
+        faculty_specs = copy.deepcopy(self.faculty_members)
+        if scope.trigger.trigger_type in (RescheduleTriggerType.FACULTY_UNAVAILABLE, RescheduleTriggerType.FACULTY_EARLY_DEPARTURE):
+            faculty = faculty_specs.get(scope.trigger.faculty_id)
+            if faculty:
+                faculty.unavailable_slot_ids.update(scope.trigger.slot_ids)
+
+        solver_result = CPSATScheduler(
+            grid=self.grid,
+            sessions=generated,
+            participant_groups=group_specs,
+            faculty_members=faculty_specs,
+            reserved_slot_ids=reserved,
+        ).solve()
+        if not solver_result.is_feasible or len(solver_result.assignments) != len(generated):
+            return None
+
+        resources = copy.deepcopy(self.resources)
+        resources_by_id = {resource.resource_id: resource for resource in resources}
+        for session in scope.unaffected_sessions:
+            resource = resources_by_id.get(session.resource_id)
+            if resource:
+                resource.unavailable_slot_ids.update(session.occupied_slot_ids)
+        if scope.trigger.trigger_type in (RescheduleTriggerType.ROOM_UNAVAILABLE, RescheduleTriggerType.EMERGENCY_ROOM_CHANGE):
+            resource = resources_by_id.get(scope.trigger.resource_id)
+            if resource:
+                resource.unavailable_slot_ids.update(scope.trigger.slot_ids)
+
+        allocation_result = SmartResourceAllocator(resources).allocate_and_validate(solver_result.assignments)
+        if not allocation_result.is_feasible or not allocation_result.validation_passed:
+            return None
+
+        replacements = {allocation.label: allocation for allocation in allocation_result.allocations}
+        if len(replacements) != len(scope.affected_sessions):
+            return None
+        resolved = list(scope.unaffected_sessions) + list(allocation_result.allocations)
+        audit_entries: list[RescheduleAuditEntry] = []
+        original_by_label = {assignment.label: assignment for assignment in scope.affected_sessions}
+        for label, updated in replacements.items():
+            original = original_by_label.get(label)
+            if original is None:
+                return None
+            audit_entries.append(RescheduleAuditEntry(
+                session_label=label,
+                trigger_type=scope.trigger.trigger_type.value,
+                reason=scope.trigger.reason or "Affected sessions re-solved by CP-SAT",
+                old_day=original.day,
+                old_slot_ids=list(original.occupied_slot_ids),
+                old_start_time=original.start_time,
+                old_end_time=original.end_time,
+                old_resource_code=original.resource_code,
+                old_faculty_ids=list(original.faculty_ids),
+                new_day=updated.day,
+                new_slot_ids=list(updated.occupied_slot_ids),
+                new_start_time=updated.start_time,
+                new_end_time=updated.end_time,
+                new_resource_code=updated.resource_code,
+                new_faculty_ids=list(updated.faculty_ids),
+            ))
+
+        changed_count = len(scope.affected_sessions)
+        total = len(resolved)
+        stability = round((len(scope.unaffected_sessions) / total) * 100.0, 2) if total else 100.0
+        preference_penalty = sum(
+            1.0 for updated in allocation_result.allocations for fid in updated.faculty_ids
+            if faculty_specs.get(fid) and faculty_specs[fid].preferred_slot_ids
+            and not all(sid in faculty_specs[fid].preferred_slot_ids for sid in updated.occupied_slot_ids)
+        )
+        room_change_penalty = sum(1.0 for entry in audit_entries if entry.old_resource_code != entry.new_resource_code)
+        return RescheduleResolution(
+            resolution_id="RES_REDUCED_CPSAT",
+            title="Reduced CP-SAT Reschedule with Resource Reallocation",
+            strategy_type="TIME_SHIFT",
+            changed_sessions_count=changed_count,
+            stability_percentage=stability,
+            disruption_score=2.0 * changed_count + preference_penalty + room_change_penalty,
+            resolved_allocations=resolved,
+            audit_entries=audit_entries,
+        )
+
+    def _validate_resolution(self, allocations: Sequence[AllocatedSession]) -> list[str]:
+        errors: list[str] = []
+        faculty_slots: set[tuple[int, int, int]] = set()
+        subbatch_slots: set[tuple[int, int, int]] = set()
+        resource_slots: set[tuple[int, int, int]] = set()
+        faculty_hours: dict[int, float] = {}
+        for assignment in allocations:
+            if assignment.start_slot_id not in self.grid.slot_by_id:
+                errors.append(f"HC-12 Violation: '{assignment.label}' has an invalid start slot.")
+                continue
+            try:
+                expected = self.grid.get_occupied_slots(assignment.start_slot_id, assignment.duration_minutes)
+            except (KeyError, IndexError, StopIteration, ValueError):
+                expected = []
+            if expected != assignment.occupied_slot_ids or self.grid.slot_by_id[assignment.start_slot_id].day != assignment.day:
+                errors.append(f"HC-12/14 Violation: '{assignment.label}' does not occupy a valid continuous interval.")
+                continue
+            if assignment.session_type != SessionType.EVENT.value and any(sid in self.reserved_slot_ids for sid in expected):
+                errors.append(f"HC-15 Violation: '{assignment.label}' overlaps a reserved institutional event slot.")
+            if not assignment.subbatch_ids or len(set(assignment.subbatch_ids)) != len(assignment.subbatch_ids):
+                errors.append(f"HC-13 Violation: '{assignment.label}' has an invalid participant group.")
+            group = self.participant_groups.get(assignment.participant_group_id)
+            if self.participant_groups and (group is None or set(group.subbatch_ids) != set(assignment.subbatch_ids)):
+                errors.append(f"HC-13 Violation: '{assignment.label}' participant group does not match its registered sub-batches.")
+            resource = self.resources_by_id.get(assignment.resource_id)
+            if not resource:
+                errors.append(f"HC-02/06 Violation: '{assignment.label}' references missing resource {assignment.resource_id}.")
+            else:
+                if not resource.is_active or any(sid in resource.unavailable_slot_ids for sid in expected):
+                    errors.append(f"HC-06 Violation: resource '{resource.code}' is inactive or unavailable for '{assignment.label}'.")
+                if resource.capacity < assignment.required_capacity:
+                    errors.append(f"HC-07/16 Violation: resource '{resource.code}' lacks capacity for '{assignment.label}'.")
+                if assignment.required_resource_type is not None and resource.resource_type != assignment.required_resource_type:
+                    errors.append(f"HC-08/09 Violation: resource '{resource.code}' has the wrong type for '{assignment.label}'.")
+                if resource.department_id is not None and resource.department_id != assignment.department_id:
+                    errors.append(f"Department Access Violation: resource '{resource.code}' is not accessible to '{assignment.label}'.")
+                if any(resource.equipment.get(name.strip().lower(), 0) < qty for name, qty in assignment.required_equipment.items()):
+                    errors.append(f"HC-09 Violation: resource '{resource.code}' lacks required equipment for '{assignment.label}'.")
+            for sid in expected:
+                for fid in assignment.faculty_ids:
+                    if fid not in self.faculty_members:
+                        errors.append(f"HC-01/05 Violation: '{assignment.label}' references unknown faculty {fid}.")
+                    faculty = self.faculty_members.get(fid)
+                    if faculty and sid in faculty.unavailable_slot_ids:
+                        errors.append(f"HC-05 Violation: faculty {fid} unavailable for '{assignment.label}' at slot {sid}.")
+                    fk = (assignment.day, sid, fid)
+                    if fk in faculty_slots:
+                        errors.append(f"HC-01 Violation: faculty {fid} has overlapping sessions at slot {sid}.")
+                    faculty_slots.add(fk)
+                    faculty_hours[fid] = faculty_hours.get(fid, 0.0) + assignment.duration_minutes / max(1, len(expected)) / 60.0
+                for sbid in assignment.subbatch_ids:
+                    sk = (assignment.day, sid, sbid)
+                    if sk in subbatch_slots:
+                        errors.append(f"HC-03/04 Violation: sub-batch {sbid} has overlapping sessions at slot {sid}.")
+                    subbatch_slots.add(sk)
+                rk = (assignment.day, sid, assignment.resource_id)
+                if rk in resource_slots:
+                    errors.append(f"HC-02 Violation: resource {assignment.resource_id} has overlapping sessions at slot {sid}.")
+                resource_slots.add(rk)
+        for fid, hours in faculty_hours.items():
+            faculty = self.faculty_members.get(fid)
+            if faculty and hours > faculty.max_weekly_hours:
+                errors.append(f"HC-10 Violation: faculty {fid} exceeds maximum weekly workload.")
+        return errors
 
     # -----------------------------------------------------------------------
     # Strategy Implementations
@@ -351,6 +609,7 @@ class DynamicRescheduler:
                 and r.resource_type == req_type
                 and r.capacity >= aff.required_capacity
                 and (r.department_id is None or r.department_id == aff.department_id)
+                and all(r.equipment.get(name.strip().lower(), 0) >= qty for name, qty in aff.required_equipment.items())
             ]
 
             # Filter candidates free at aff.occupied_slot_ids
@@ -380,6 +639,7 @@ class DynamicRescheduler:
             new_alloc.resource_code = free_cand.code
             new_alloc.resource_name = free_cand.name
             new_alloc.resource_capacity = free_cand.capacity
+            new_alloc.resource_type = free_cand.resource_type
             resolved.append(new_alloc)
 
             audit_entries.append(
@@ -519,11 +779,18 @@ class DynamicRescheduler:
         temp_sb = copy.deepcopy(frozen_sb_slots)
         temp_res = copy.deepcopy(frozen_res_slots)
 
-        valid_starts = self.grid.get_valid_start_slots_for_duration(60)
-        valid_starts_120 = self.grid.get_valid_start_slots_for_duration(120)
-
         for aff in scope.affected_sessions:
-            starts = valid_starts_120 if aff.duration_minutes >= 120 else valid_starts
+            starts = self.grid.get_valid_start_slots_for_duration(aff.duration_minutes)
+            starts.sort(key=lambda start_id: (
+                not all(
+                    not self.faculty_members.get(fid)
+                    or not self.faculty_members[fid].preferred_slot_ids
+                    or all(sid in self.faculty_members[fid].preferred_slot_ids
+                           for sid in self.grid.get_occupied_slots(start_id, aff.duration_minutes))
+                    for fid in aff.faculty_ids
+                ),
+                start_id != aff.start_slot_id,
+            ))
             placed = False
 
             # Search across all operational days for an open slot
@@ -581,7 +848,8 @@ class DynamicRescheduler:
                 # 3. Resource Check (HC-02)
                 # First try original room; if occupied, search other compatible rooms
                 req_type = aff.required_resource_type or ResourceType.CLASSROOM
-                candidate_rooms = [self.resources_by_id[aff.resource_id]] if aff.resource_id in self.resources_by_id else []
+                original_room = self.resources_by_id.get(aff.resource_id)
+                candidate_rooms = [original_room] if original_room and original_room.is_active and original_room.resource_type == req_type and original_room.capacity >= aff.required_capacity and (original_room.department_id is None or original_room.department_id == aff.department_id) and all(original_room.equipment.get(name.strip().lower(), 0) >= qty for name, qty in aff.required_equipment.items()) else []
                 # Add other rooms of same type
                 candidate_rooms.extend([
                     r for r in self.resources
@@ -590,6 +858,7 @@ class DynamicRescheduler:
                     and r.resource_type == req_type
                     and r.capacity >= aff.required_capacity
                     and (r.department_id is None or r.department_id == aff.department_id)
+                    and all(r.equipment.get(name.strip().lower(), 0) >= qty for name, qty in aff.required_equipment.items())
                 ])
 
                 chosen_room = None
@@ -620,6 +889,7 @@ class DynamicRescheduler:
                 new_alloc.resource_code = chosen_room.code
                 new_alloc.resource_name = chosen_room.name
                 new_alloc.resource_capacity = chosen_room.capacity
+                new_alloc.resource_type = chosen_room.resource_type
                 resolved.append(new_alloc)
 
                 audit_entries.append(
@@ -649,6 +919,14 @@ class DynamicRescheduler:
 
         changed_count = len(scope.affected_sessions)
         stability = round((len(scope.unaffected_sessions) / (len(scope.unaffected_sessions) + changed_count)) * 100.0, 2)
+        preference_penalty = sum(
+            1.0 for assignment in scope.affected_sessions for fid in assignment.faculty_ids
+            if self.faculty_members.get(fid)
+            and self.faculty_members[fid].preferred_slot_ids
+            and not all(sid in self.faculty_members[fid].preferred_slot_ids
+                        for sid in next((entry.new_slot_ids for entry in audit_entries if entry.session_label == assignment.label), []))
+        )
+        room_change_penalty = sum(1.0 for entry in audit_entries if entry.old_resource_code != entry.new_resource_code)
 
         return RescheduleResolution(
             resolution_id="RES_TIME_SHIFT",
@@ -656,7 +934,7 @@ class DynamicRescheduler:
             strategy_type="TIME_SHIFT",
             changed_sessions_count=changed_count,
             stability_percentage=stability,
-            disruption_score=2.0 * changed_count,  # Time shift has higher disruption than substitute
+            disruption_score=2.0 * changed_count + preference_penalty + room_change_penalty,
             resolved_allocations=resolved,
             audit_entries=audit_entries,
         )
@@ -676,9 +954,13 @@ class DynamicRescheduler:
         event_name = ev_details.get("title", "Campus Academic Event")
         ev_room_id = scope.trigger.resource_id or (scope.affected_sessions[0].resource_id if scope.affected_sessions else 1)
         ev_room = self.resources_by_id.get(ev_room_id)
+        if ev_room is None or not ev_room.is_active:
+            return None
         ev_subbatches = list(scope.affected_subbatch_ids)
         ev_fac_ids = ev_details.get("faculty_ids", [scope.trigger.faculty_id] if scope.trigger.faculty_id else [])
 
+        if not scope.trigger.slot_ids or any(sid not in self.grid.slot_by_id for sid in scope.trigger.slot_ids):
+            return None
         start_slot = self.grid.slot_by_id[scope.trigger.slot_ids[0]]
         end_slot = self.grid.slot_by_id[scope.trigger.slot_ids[-1]]
 
@@ -691,19 +973,19 @@ class DynamicRescheduler:
             start_slot_id=scope.trigger.slot_ids[0],
             start_time=start_slot.start_time,
             end_time=end_slot.end_time,
-            duration_minutes=len(scope.trigger.slot_ids) * 60,
+            duration_minutes=sum(self.grid.slot_by_id[sid].duration_minutes for sid in scope.trigger.slot_ids),
             occupied_slot_ids=scope.trigger.slot_ids,
             faculty_ids=ev_fac_ids,
             participant_group_id=0,
             subbatch_ids=ev_subbatches,
-            department_id=1,
+            department_id=(scope.affected_sessions[0].department_id if scope.affected_sessions and len({s.department_id for s in scope.affected_sessions}) == 1 else (ev_room.department_id or 0)),
             required_resource_type=ResourceType.AUDITORIUM if ev_room and ev_room.resource_type == ResourceType.AUDITORIUM else ResourceType.SEMINAR_HALL,
-            required_capacity=sum(len(ev_subbatches) * 20 for _ in [1]),
+            required_capacity=int(ev_details.get("participant_strength", max((s.required_capacity for s in scope.affected_sessions), default=0))),
             resource_id=ev_room_id,
-            resource_code=ev_room.code if ev_room else "AUD",
-            resource_name=ev_room.name if ev_room else "Auditorium",
-            resource_type=ev_room.resource_type if ev_room else ResourceType.AUDITORIUM,
-            resource_capacity=ev_room.capacity if ev_room else 300,
+            resource_code=ev_room.code,
+            resource_name=ev_room.name,
+            resource_type=ev_room.resource_type,
+            resource_capacity=ev_room.capacity,
             resource_score=1.0,
         )
         resolved.append(event_session)

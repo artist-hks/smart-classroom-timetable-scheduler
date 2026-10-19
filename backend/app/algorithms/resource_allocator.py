@@ -18,6 +18,8 @@ from typing import Any, Sequence
 from app.algorithms.cpsat_solver import ScheduledAssignment
 from app.models.academic import ResourceType, SessionType
 
+DEFAULT_RESOURCE_REVALIDATION_ATTEMPTS = 3
+
 
 @dataclass
 class ResourceSpec:
@@ -88,6 +90,7 @@ class AllocatedSession:
     resource_capacity: int
     resource_score: float
     score_breakdown: dict[str, float] = field(default_factory=dict)
+    required_equipment: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -160,7 +163,14 @@ class SmartResourceAllocator:
 
         # Normalize weights
         raw_weights = {**self.DEFAULT_WEIGHTS, **(weights or {})}
+        unknown = set(raw_weights) - set(self.DEFAULT_WEIGHTS)
+        if unknown:
+            raise ValueError(f"Unknown resource scoring weights: {sorted(unknown)}")
+        if any(not math.isfinite(float(v)) or float(v) < 0 for v in raw_weights.values()):
+            raise ValueError("Resource scoring weights must be finite and non-negative.")
         total_w = sum(raw_weights.values())
+        if total_w <= 0:
+            raise ValueError("At least one resource scoring weight must be positive.")
         self.weights = {k: v / total_w for k, v in raw_weights.items()}
 
     def filter_candidate_resources(
@@ -177,7 +187,7 @@ class SmartResourceAllocator:
         1. Active status: resource.is_active is True
         2. Exclusions: resource_id not in excluded_resource_ids (used during backtracking/re-scoring)
         3. Resource Type suitability: resource.resource_type == session.required_resource_type (HC-08, HC-09)
-        4. Department Isolation / Shared Access: resource belongs to department or is shared (HC-12)
+        4. Department Isolation / Shared Access: resource belongs to department or is shared
         5. Capacity constraint: resource.capacity >= session.required_capacity (HC-07, HC-16)
         6. Equipment sufficiency: resource equipment matches or exceeds required (HC-09)
         7. Resource availability: resource not in maintenance/unavailability for session slots (HC-06)
@@ -189,7 +199,7 @@ class SmartResourceAllocator:
         candidates: list[ResourceSpec] = []
         rejection_reasons: list[str] = []
         excluded = excluded_resource_ids or set()
-        req_eq = {k.strip().lower(): v for k, v in (required_equipment or {}).items()}
+        req_eq = {k.strip().lower(): v for k, v in (required_equipment or session.required_equipment or {}).items()}
 
         for r in self.resources:
             # 1. Active status check
@@ -207,7 +217,7 @@ class SmartResourceAllocator:
                 )
                 continue
 
-            # 4. Department Isolation & Shared Access (HC-12)
+            # 4. Department Isolation & Shared Access
             # department_id is nullable: NULL means institute-wide shared resource
             if r.department_id is not None and r.department_id != session.department_id:
                 rejection_reasons.append(
@@ -376,7 +386,7 @@ class SmartResourceAllocator:
         sorted_assignments = sorted(assignments, key=session_priority_key)
 
         for session in sorted_assignments:
-            req_eq = session_eq.get(session.session_id or 0)
+            req_eq = session_eq.get(session.session_id or 0, session.required_equipment)
             candidates, rejection_reasons = self.filter_candidate_resources(
                 session=session,
                 current_bookings=current_bookings,
@@ -447,6 +457,7 @@ class SmartResourceAllocator:
                 resource_capacity=best_resource.capacity,
                 resource_score=best_score,
                 score_breakdown=best_breakdown,
+                required_equipment=dict(req_eq or {}),
             )
             allocated_sessions.append(allocated)
 
@@ -481,7 +492,7 @@ class SmartResourceAllocator:
         3. HC-07 / HC-16 (Resource Capacity): resource.capacity >= session.required_capacity
         4. HC-08 (Resource Suitability): resource.resource_type == session.required_resource_type
         5. HC-09 (Lab Requirement): Required equipment present in sufficient quantity
-        6. HC-12 (Department Access): Resource belongs to session department or is shared institute resource
+        6. Department Access: Resource belongs to session department or is shared institute resource
         """
         errors: list[str] = []
         session_eq = session_equipment or {}
@@ -531,15 +542,15 @@ class SmartResourceAllocator:
                     f"session '{a.label}' required type ({a.required_resource_type.value})."
                 )
 
-            # Department Isolation & Access (HC-12)
+            # Department Isolation & Access
             if res.department_id is not None and res.department_id != a.department_id:
                 errors.append(
-                    f"HC-12 Violation: Resource '{res.code}' belongs to dept {res.department_id}, "
+                    f"Department Access Violation: Resource '{res.code}' belongs to dept {res.department_id}, "
                     f"cannot be used by session '{a.label}' of dept {a.department_id}."
                 )
 
             # Equipment Check (HC-09)
-            req_eq = session_eq.get(a.session_id or 0, {})
+            req_eq = session_eq.get(a.session_id or 0, a.required_equipment)
             for eq_name, min_qty in req_eq.items():
                 r_qty = res.equipment.get(eq_name.strip().lower(), 0)
                 if r_qty < min_qty:
@@ -556,7 +567,7 @@ class SmartResourceAllocator:
         assignments: Sequence[ScheduledAssignment],
         session_equipment: dict[int, dict[str, int]] | None = None,
         preferred_building: str | None = None,
-        max_revalidation_attempts: int = 3,
+        max_revalidation_attempts: int = DEFAULT_RESOURCE_REVALIDATION_ATTEMPTS,
     ) -> ResourceAllocationResult:
         """
         Executes end-to-end Smart Resource Allocation and Mandatory Validation (FR-3.8.1 - FR-3.8.5).
@@ -564,6 +575,8 @@ class SmartResourceAllocator:
         If revalidation detects conflicts, it initiates backtracking and re-scoring against
         remaining candidates (FR-3.8.5) up to max_revalidation_attempts before reporting infeasibility.
         """
+        if max_revalidation_attempts < 0:
+            raise ValueError("max_revalidation_attempts must be non-negative.")
         result = self.allocate(
             assignments=assignments,
             session_equipment=session_equipment,
